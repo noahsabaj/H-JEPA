@@ -39,6 +39,12 @@ def _sigreg_module_name(component, level):
     return f"sigreg_{component}_level{level}"
 
 
+def _rdmreg_module_name(component, level):
+    if component == "embed":
+        return f"rdmreg_level{level}"
+    return f"rdmreg_{component}_level{level}"
+
+
 def _pred_component(pred, output, level, component):
     # Fusion-level predictions are [pixel | proprio] along the channel dim (2 for patch
     # tokens, last otherwise).
@@ -145,6 +151,17 @@ def hjepa_forward(self, batch, stage, cfg, *, normalize_batch):
                     else component_loss + weighted_sigreg_loss
                 )
 
+            if _loss_term_enabled(component_cfg, "rdmreg"):
+                rdmreg = getattr(self, _rdmreg_module_name(component, level))
+                rdmreg_loss = rdmreg(component_emb.flatten(2).transpose(0, 1))
+                output[_component_loss_key("rdmreg", component, level_suffix)] = rdmreg_loss
+                weighted_rdmreg_loss = _loss_term_weight(component_cfg, "rdmreg") * rdmreg_loss
+                component_loss = (
+                    weighted_rdmreg_loss
+                    if component_loss is None
+                    else component_loss + weighted_rdmreg_loss
+                )
+
             if component_loss is None:
                 continue
             output[f"{component}_loss{level_suffix}"] = component_loss
@@ -180,7 +197,7 @@ def hjepa_forward(self, batch, stage, cfg, *, normalize_batch):
 
 
 def create_world_model(cfg):
-    from loss import InverseDynamicsLoss, InverseDynamicsModel, SIGReg
+    from loss import InverseDynamicsLoss, InverseDynamicsModel, RDMReg, SIGReg
     from models.encoders.build_encoder import build_encoder
     from models.encoders.seq_encoder import SequenceEncoder, SequenceMLPEncoder
     from models.hjepa import HJEPA
@@ -271,7 +288,13 @@ def create_world_model(cfg):
 
         predictor_cfg = dict(level_cfg.predictor)
         if predictor_cfg.pop("type", None) == "causal_transformer":
+            predictor_projector_cfg = predictor_cfg.pop("projector", None)
             predictor = CausalTransformerPredictor(input_dim=embed_dim, **predictor_cfg)
+            if predictor_projector_cfg is not None:  # e.g. LpWM's pred_proj head with the sparse link
+                predictor = ProjectedPredictor(
+                    predictor,
+                    build_projector(predictor_projector_cfg, input_dim=embed_dim, output_dim=embed_dim),
+                )
         else:
             predictor_projector_cfg = predictor_cfg.pop("projector")
             predictor = ProjectedPredictor(
@@ -343,6 +366,11 @@ def create_world_model(cfg):
     for level in range(1, int(cfg.num_levels) + 1):
         level_cfg = cfg[f"level{level}"]
         for component, component_cfg in _loss_components(level_cfg.loss).items():
+            if _loss_term_enabled(component_cfg, "rdmreg"):
+                rdmreg_kwargs = {
+                    k: v for k, v in component_cfg.rdmreg.items() if k not in {"enabled", "weight"}
+                }
+                losses[_rdmreg_module_name(component, level)] = RDMReg(**rdmreg_kwargs)
             if not _loss_term_enabled(component_cfg, "sigreg"):
                 continue
             sigreg_cfg = component_cfg.sigreg

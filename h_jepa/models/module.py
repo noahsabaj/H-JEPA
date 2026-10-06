@@ -28,6 +28,7 @@ def build_projector(projector_cfg, *, input_dim: int, output_dim: int) -> nn.Mod
             output_dim=output_dim,
             hidden_dim=2048,
             norm_fn=nn.BatchNorm1d,
+            link=str(projector_cfg.get("link", "identity")).lower(),
         )
 
     raise ValueError(f"Unsupported projector type '{projector_cfg.get('type')}'")
@@ -231,8 +232,17 @@ class Embedder(nn.Module):
         return x
 
 
+class RepReLU(nn.Module):
+    """ReLU forward (exact zeros), GELU gradient backward (no dead units): LpWM's sparse link."""
+
+    def forward(self, x):
+        g = F.gelu(x)
+        return g - g.detach() + F.relu(x).detach()
+
+
 class MLP(nn.Module):
-    """Simple MLP with optional normalization and activation"""
+    """Simple MLP with optional normalization and activation; link='reprelu' ends it with RepReLU
+    (non-negative, sparse outputs, as LpWM's projector heads)."""
 
     def __init__(
         self,
@@ -242,15 +252,19 @@ class MLP(nn.Module):
         norm_fn=nn.LayerNorm,
         act_fn=nn.GELU,
         final_ln=False,
+        link="identity",
     ):
         super().__init__()
         out_dim = output_dim or input_dim
         norm_fn = norm_fn(hidden_dim) if norm_fn is not None else nn.Identity()
+        if link not in ("identity", "reprelu"):
+            raise ValueError(f"Unsupported MLP link '{link}'")
         self.net = nn.Sequential(
             nn.Linear(input_dim, hidden_dim),
             norm_fn,
             act_fn(),
             nn.Linear(hidden_dim, out_dim),
+            *([RepReLU()] if link == "reprelu" else []),
         )
         self.final_norm = nn.LayerNorm(out_dim) if final_ln else nn.Identity()
     

@@ -1,3 +1,5 @@
+import math
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -45,6 +47,55 @@ class SIGReg(torch.nn.Module):
         err = (cos - self.phi).square() + sin.square()
         statistic = (err @ self.weights) * n
         return statistic.mean()
+
+
+class RDMReg(torch.nn.Module):
+    """RDMReg of LpWM (arXiv 2608.22764; github.com/YilunKuang/lpworldmodel, lpwm_swm/loss.py):
+    a sliced-Wasserstein match of the embeddings to a rectified generalized Gaussian. p=1 with the
+    ReLU link is a rectified product Laplace: non-negative, sparse codes. p=2 with the Identity
+    link is the dense isotropic Gaussian (a LeWM-like control).
+
+    Same call as SIGReg: proj (T, B, D). matching_mode 'b_t_d' (the LpWM default) matches each
+    time step over the batch; 'bt_d' pools all frames. rms_norm scales the ReLU target to unit
+    second moment (the paper's sparse runs). Location mu is 0.
+    """
+
+    def __init__(self, p=1.0, link="ReLU", num_slices=1024, matching_mode="b_t_d", rms_norm=True):
+        super().__init__()
+        if link not in ("ReLU", "Identity") or matching_mode not in ("b_t_d", "bt_d"):
+            raise ValueError(f"RDMReg: unsupported link={link!r} or matching_mode={matching_mode!r}")
+        self.p, self.link = float(p), link
+        self.num_slices, self.matching_mode = int(num_slices), matching_mode
+        # sigma gives the generalized Gaussian unit variance; then E[ReLU(X)^2] = 1/2.
+        self.sigma = math.sqrt(math.gamma(1 / self.p) / math.gamma(3 / self.p)) / self.p ** (1 / self.p)
+        self.scale = math.sqrt(2.0) if rms_norm and link == "ReLU" else 1.0
+
+    def sample(self, shape, device):
+        if self.p == 1.0:  # Laplace by the inverse CDF, on the device
+            u = (torch.rand(shape, device=device) - 0.5).clamp(-0.5 + 1e-7, 0.5 - 1e-7)
+            x = -self.sigma * torch.sign(u) * torch.log1p(-2 * u.abs())
+        elif self.p == 2.0:
+            x = self.sigma * torch.randn(shape, device=device)
+        else:
+            sign = torch.randint(0, 2, shape, device=device) * 2 - 1
+            g = torch.distributions.Gamma(torch.tensor(1 / self.p, device=device), 1.0).sample(shape)
+            x = self.sigma * sign * (self.p * g).pow(1 / self.p)
+        if self.link == "ReLU":
+            x = F.relu(x)
+        return x * self.scale
+
+    def forward(self, proj):
+        """
+        proj: (T, B, D)
+        """
+        z = proj.float()
+        if self.matching_mode == "bt_d":
+            z = z.reshape(1, -1, z.size(-1))
+        dirs = torch.randn(z.size(-1), self.num_slices, device=z.device)
+        dirs = dirs / dirs.norm(dim=0, keepdim=True)
+        a = torch.sort(z @ dirs, dim=1).values
+        b = torch.sort(self.sample(tuple(z.shape), z.device) @ dirs, dim=1).values
+        return (a - b).square().mean()
 
 
 class InverseDynamicsModel(nn.Module):

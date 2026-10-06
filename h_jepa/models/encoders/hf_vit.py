@@ -16,6 +16,7 @@ def create_hf_vit(
     patch_size: int = 16,
     image_size: int = 224,
     use_mask_token: bool = True,
+    gradient_checkpointing: bool = False,
     **kwargs,
 ) -> nn.Module:
     if size not in VIT_SIZE_CONFIGS:
@@ -37,4 +38,6 @@ def create_hf_vit(
     )
 
     model.config.interpolate_pos_encoding = True
+    if gradient_checkpointing:  # recompute block activations in the backward pass: less memory
+        model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
     return model
