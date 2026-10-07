@@ -219,6 +219,8 @@ def create_world_model(cfg):
     for level in range(1, int(cfg.num_levels) + 1):
         level_cfg = cfg[f"level{level}"]
         target_length = int(level_cfg.wm.history_size) + int(level_cfg.wm.get("rollout_n", 1))
+        if float(level_cfg.get("ep_idm_coeff", 0.0)) > 0:  # EP-IDM needs whole clips of horizon + 1 frames
+            target_length = max(target_length, int(level_cfg.ep_idm.horizon) + 1)
         encoder_cfg = dict(level_cfg.encoder)
         encoder_projector_cfg = encoder_cfg.pop("projector")
 
