@@ -181,6 +181,12 @@ def hjepa_forward(self, batch, stage, cfg, *, normalize_batch):
             output[f"idm_loss{level_suffix}"] = idm_loss
             level_loss = level_loss + idm_coeff * idm_loss
 
+        ep_idm_coeff = float(level_cfg.get("ep_idm_coeff", 0.0))
+        if ep_idm_coeff > 0:
+            ep_idm_loss = jepa.ep_idm_loss_fn(emb, act_emb)
+            output[f"ep_idm_loss{level_suffix}"] = ep_idm_loss
+            level_loss = level_loss + ep_idm_coeff * ep_idm_loss
+
         if level_loss is None:
             continue
         output[f"loss{level_suffix}"] = level_loss
@@ -197,7 +203,7 @@ def hjepa_forward(self, batch, stage, cfg, *, normalize_batch):
 
 
 def create_world_model(cfg):
-    from loss import InverseDynamicsLoss, InverseDynamicsModel, RDMReg, SIGReg
+    from loss import EndpointInverseDynamicsLoss, InverseDynamicsLoss, InverseDynamicsModel, RDMReg, SIGReg
     from models.encoders.build_encoder import build_encoder
     from models.encoders.seq_encoder import SequenceEncoder, SequenceMLPEncoder
     from models.hjepa import HJEPA
@@ -357,6 +363,13 @@ def create_world_model(cfg):
                     hidden_dim=int(level_cfg.idm.hidden_dim),
                     action_dim=int(level_cfg.predictor.action_dim),
                 )
+            )
+        if float(level_cfg.get("ep_idm_coeff", 0.0)) > 0:
+            jepa.ep_idm_loss_fn = EndpointInverseDynamicsLoss(
+                state_dim=embed_dim,
+                hidden_dim=int(level_cfg.ep_idm.hidden_dim),
+                action_dim=int(level_cfg.predictor.action_dim),
+                horizon=int(level_cfg.ep_idm.horizon),
             )
 
         jepas.append(jepa)

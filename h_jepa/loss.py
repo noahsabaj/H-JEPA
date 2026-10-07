@@ -114,6 +114,40 @@ class InverseDynamicsModel(nn.Module):
         return self.model(torch.cat([state_t, state_t_plus_1], dim=1))
 
 
+class EndpointInverseDynamicsLoss(nn.Module):
+    """Endpoint inverse dynamics (EP-IDM; Toso, LeCun, Anderson, Bounou, arXiv 2610.07540): an MLP
+    reconstructs the whole action sequence a_s..a_{s+H-1} from only the latents z_s and z_{s+H}.
+    Exact reconstruction keeps every state direction that actions reach within H steps, so the encoder
+    cannot drop what the actions change (e.g. a cube that the arm moves). Every start s of the clip
+    with s + H inside it is used.
+    """
+
+    def __init__(self, state_dim, hidden_dim, action_dim, horizon):
+        super().__init__()
+        self.horizon, self.action_dim = int(horizon), int(action_dim)
+        self.model = nn.Sequential(
+            nn.Linear(state_dim * 2, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, self.horizon * self.action_dim),
+        )
+        self.apply(init_module_weights)
+
+    def forward(self, emb, action):
+        """
+        emb: (B, T, D) with T >= horizon + 1, action: (B, T, A) or (B, T-1, A)
+        """
+        H, starts = self.horizon, emb.size(1) - self.horizon
+        if starts < 1:
+            raise ValueError(f"EP-IDM needs clips of horizon + 1 = {H + 1} frames, got {emb.size(1)}")
+        z0 = emb[:, :starts].flatten(0, 1)
+        zH = emb[:, H : H + starts].flatten(0, 1)
+        pred = self.model(torch.cat([z0, zH], dim=1)).view(-1, H, self.action_dim)
+        target = torch.stack([action[:, s : s + H] for s in range(starts)], dim=1).flatten(0, 1)
+        return F.mse_loss(pred, target.detach())
+
+
 class InverseDynamicsLoss(nn.Module):
     """MSE between the IDM action predicted from (z_t, z_t+1) and the raw action a_t."""
 
