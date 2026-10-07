@@ -14,15 +14,10 @@ class AdamCScheduleFreePlus(torch.optim.Optimizer):
     / EMA(|g|_1 sqrt(pi/2)), with f the training loss (f* taken as 0, as in the paper's Algorithm
     1); the schedule is Schedule-Free averaging (x: evaluation weights, y: gradient point, z: AdamW
     iterate). Weight decay is AdamC: decoupled, scaled by lr^2, so its values are like 5 to 50.
-    fstar="fit" (our addition, so101-jepa A23): a loss with a floor far above 0 (a JEPA loss with
-    regularizers: SIGReg, inverse dynamics) makes the f* = 0 step far too large. Then f* is the floor c
-    of the loss curve a / sqrt(t + b) + c (the paper's own loss model), fitted to the loss history
-    every `fit_every` steps; before the first fit (fit_start steps) f* is the lowest loss so far.
     Call .train() / .eval() as for every Schedule-Free optimizer (h_jepa ScheduleFreeModes)."""
 
     def __init__(self, params, lr=1.0, betas=(0.9, 0.95), sf_beta1=0.9, eps=1e-8, weight_decay=0.0, r=0.0,
-                 polyak_beta=0.0, c_warmup=0, sf_beta1_anneal_steps=0, sf_beta1_max=0.965, weight_lr_power=2.0,
-                 fstar="zero", fit_start=200, fit_every=50):
+                 polyak_beta=0.0, c_warmup=0, sf_beta1_anneal_steps=0, sf_beta1_max=0.965, weight_lr_power=2.0):
         defaults = dict(lr=lr, betas=tuple(betas), sf_beta1=sf_beta1, eps=eps, r=r, k=0, train_mode=False,
                         weight_sum=0.0, lr_max=eps, scheduled_lr=0.0, polyak_beta=polyak_beta,
                         sf_beta1_anneal_steps=sf_beta1_anneal_steps, sf_beta1_max=sf_beta1_max,
@@ -30,32 +25,7 @@ class AdamCScheduleFreePlus(torch.optim.Optimizer):
                         weight_decay=weight_decay)
         super().__init__(params, defaults)
         self.function_value = None
-        self.fstar_mode, self.fit_start, self.fit_every = fstar, int(fit_start), int(fit_every)
-        self.losses, self.fstar = [], 0.0
 
-    def _update_fstar(self, k):
-        """The loss floor: c of a / sqrt(t + b) + c fitted (least squares, b on a grid) to the loss
-        history averaged over windows of 10 steps; never above the lowest window average."""
-        self.losses.append(self.function_value)
-        n = len(self.losses) // 10
-        if n == 0:
-            return
-        windows = [sum(self.losses[10 * i:10 * i + 10]) / 10 for i in range(n)]
-        if k < self.fit_start:
-            self.fstar = min(windows) if k >= 10 else 0.0
-            return
-        if k % self.fit_every:
-            return
-        t = torch.arange(n, dtype=torch.float64) * 10 + 5
-        y = torch.tensor(windows, dtype=torch.float64)
-        best = None
-        for b in (1.0, 10.0, 100.0, 1000.0, 10000.0):
-            A = torch.stack([1 / torch.sqrt(t + b), torch.ones_like(t)], 1)
-            sol = torch.linalg.lstsq(A, y[:, None]).solution[:, 0]
-            res = float(((A @ sol - y) ** 2).sum())
-            if best is None or res < best[0]:
-                best = (res, float(sol[1]))
-        self.fstar = min(best[1], min(windows))
     @torch.no_grad()
     def eval(self):
         for group in self.param_groups:
@@ -105,11 +75,9 @@ class AdamCScheduleFreePlus(torch.optim.Optimizer):
         grad_l1 = torch.stack(l1).sum().item() if l1 else 0.0
         ip_term = torch.stack(ip).sum().item() if ip else 0.0
         ema = pb * g0["grad_l1_ema"] + (1 - pb) * grad_l1 * math.sqrt(math.pi / 2)
-        if self.fstar_mode == "fit":
-            self._update_fstar(k)
-        polyak_lr = max(0.0, self.function_value - self.fstar + ip_term) / max(ema / (1 - pb ** (k + 1)), 1e-30)
+        polyak_lr = max(0.0, self.function_value + ip_term) / max(ema / (1 - pb ** (k + 1)), 1e-30)
         if os.environ.get("SFPLUS_DEBUG") and (k % 10 == 0 or os.environ["SFPLUS_DEBUG"] == "all"):
-            print(f"sfplus k={k} f={self.function_value:.4g} fstar={self.fstar:.4g} ip={ip_term:.4g} l1={grad_l1:.4g} polyak_lr={polyak_lr:.4g} "
+            print(f"sfplus k={k} f={self.function_value:.4g} ip={ip_term:.4g} l1={grad_l1:.4g} polyak_lr={polyak_lr:.4g} "
                   f"warm={g0['lr']:.3g}", flush=True)
 
         for group in self.param_groups:
