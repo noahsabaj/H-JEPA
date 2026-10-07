@@ -41,6 +41,13 @@ IMAGENET_STD = (0.229, 0.224, 0.225)
 
 
 class GradClipModule(spt.Module):
+    def manual_backward(self, loss, *args, **kwargs):
+        # A Polyak-step optimizer (sfplus.AdamCScheduleFreePlus) needs the loss value at its step.
+        for opt in self.trainer.optimizers if self._trainer is not None else ():
+            if hasattr(opt, "function_value"):
+                opt.function_value = float(loss.detach())
+        return super().manual_backward(loss, *args, **kwargs)
+
     def clip_gradients(self, optimizer, gradient_clip_val=None, gradient_clip_algorithm=None):
         if not self._train_cfg.get("grad_clip_per_level", False):
             return super().clip_gradients(optimizer, gradient_clip_val, gradient_clip_algorithm)
@@ -113,6 +120,7 @@ def _build_hjepa_optimizer_factory(model, cfg):
     optimizer_cfg = OmegaConf.to_container(cfg.optimizer, resolve=True)
     optimizer_cfg.pop("warmup_ratio", None)
     optimizer_cfg.pop("schedule_free", None)
+    optimizer_cfg.pop("warmup_steps", None)
 
     def optimizer_factory(params):
         param_groups = []
@@ -242,9 +250,10 @@ def run(cfg):
     hjepa_optimizer = _build_hjepa_optimizer_factory(world_model, cfg)
     scheduler = {"type": "LinearWarmupCosineAnnealingLR"}
     warmup_ratio = cfg.optimizer.get("warmup_ratio", None)
-    if cfg.optimizer.get("schedule_free", False):  # the optimizer has no schedule (it warms up itself)
+    if cfg.optimizer.get("schedule_free", False):  # no schedule; optional linear warmup (ScheduleFree+)
+        warmup_steps = int(cfg.optimizer.get("warmup_steps", 0))
         def scheduler(optimizer, module):
-            return torch.optim.lr_scheduler.LambdaLR(optimizer, lambda step: 1.0)
+            return torch.optim.lr_scheduler.LambdaLR(optimizer, lambda step: min(1.0, (step + 1) / max(1, warmup_steps)))
     elif warmup_ratio is not None:
         def scheduler(optimizer, module):
             total_steps = int(module.trainer.estimated_stepping_batches)
