@@ -1,6 +1,6 @@
 import os
 
-os.environ['MUJOCO_GL'] = 'egl'
+os.environ.setdefault('MUJOCO_GL', 'egl')  # osmesa on GPUs without graphics (AMD Instinct)
 
 from functools import partial
 from pathlib import Path
