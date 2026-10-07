@@ -1,3 +1,4 @@
+import importlib
 import os
 
 os.environ.setdefault('MUJOCO_GL', 'egl')  # osmesa on GPUs without graphics (AMD Instinct)
@@ -50,6 +51,34 @@ class GradClipModule(spt.Module):
                 torch.nn.utils.clip_grad_norm_(params, float(gradient_clip_val))
 
 
+class ScheduleFreeModes(pl.Callback):
+    """Schedule-free optimizers (e.g. schedulefree.AdamWScheduleFree) keep two weight sequences:
+    train mode while training, eval mode (the averaged weights) for validation and every save.
+    A no-op for other optimizers. Listed first, so its eval switch runs before the saves."""
+
+    @staticmethod
+    def _set(trainer, mode):
+        for opt in trainer.optimizers:
+            if hasattr(opt, "train") and hasattr(opt, "eval"):
+                getattr(opt, mode)()
+
+    def on_train_epoch_start(self, trainer, pl_module):
+        self._set(trainer, "train")
+
+    def on_validation_start(self, trainer, pl_module):
+        self._set(trainer, "eval")
+
+    def on_validation_end(self, trainer, pl_module):
+        if trainer.training:
+            self._set(trainer, "train")
+
+    def on_train_epoch_end(self, trainer, pl_module):
+        self._set(trainer, "eval")
+
+    def on_train_end(self, trainer, pl_module):
+        self._set(trainer, "eval")
+
+
 class ResumableManager(spt.Manager):
     """spt.Manager that resumes from the run dir's `ResumeCheckpoint` file.
 
@@ -83,6 +112,7 @@ class ResumableManager(spt.Manager):
 def _build_hjepa_optimizer_factory(model, cfg):
     optimizer_cfg = OmegaConf.to_container(cfg.optimizer, resolve=True)
     optimizer_cfg.pop("warmup_ratio", None)
+    optimizer_cfg.pop("schedule_free", None)
 
     def optimizer_factory(params):
         param_groups = []
@@ -103,6 +133,10 @@ def _build_hjepa_optimizer_factory(model, cfg):
             for group in param_groups
         ]
         logging.info(f"HJEPA optimizer parameter groups: {rows}")
+        if "." in optimizer_cfg["type"]:  # an optimizer from another package, e.g. prodigyopt.Prodigy
+            module, name = optimizer_cfg["type"].rsplit(".", 1)
+            kwargs = {k: v for k, v in optimizer_cfg.items() if k != "type"}
+            return getattr(importlib.import_module(module), name)(param_groups, **kwargs)
         return spt.optim.create_optimizer(param_groups, optimizer_cfg)
 
     return optimizer_factory
@@ -208,7 +242,10 @@ def run(cfg):
     hjepa_optimizer = _build_hjepa_optimizer_factory(world_model, cfg)
     scheduler = {"type": "LinearWarmupCosineAnnealingLR"}
     warmup_ratio = cfg.optimizer.get("warmup_ratio", None)
-    if warmup_ratio is not None:
+    if cfg.optimizer.get("schedule_free", False):  # the optimizer has no schedule (it warms up itself)
+        def scheduler(optimizer, module):
+            return torch.optim.lr_scheduler.LambdaLR(optimizer, lambda step: 1.0)
+    elif warmup_ratio is not None:
         def scheduler(optimizer, module):
             total_steps = int(module.trainer.estimated_stepping_batches)
             return spt.optim.create_scheduler(
@@ -311,6 +348,7 @@ def run(cfg):
     trainer = pl.Trainer(
         **cfg.trainer,
         callbacks=[
+        ScheduleFreeModes(),
         *resume_callbacks,
         debug_cleanup_callback,
         object_dump_callback,

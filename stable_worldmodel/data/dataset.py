@@ -24,6 +24,10 @@ class HDF5Dataset:
         keys_to_merge: Target column -> source columns to concatenate and cache.
         cache_dir: Directory containing the dataset file.
         level1, level2, ...: Per-level clip configs (frameskip, num_steps, window_size).
+            level1 may give `strides` (e.g. [1, 2, 3, 5, 10]) in place of one frameskip: each clip
+            then draws its stride k from the list (time-step-conditioned model, so101-jepa A21).
+            Its action per step is the k raw actions padded to max(strides) with zeros (after
+            normalization), plus k / max(strides) as the last number.
     """
 
     def __init__(
@@ -80,6 +84,9 @@ class HDF5Dataset:
             if not isinstance(normalized, dict):
                 raise TypeError(f"{level_name} must be a mapping")
 
+            if normalized.get("strides"):  # spans and clip starts are set by the largest stride
+                normalized["strides"] = [int(k) for k in normalized["strides"]]
+                normalized["frameskip"] = max(normalized["strides"])
             normalized["frameskip"] = int(normalized["frameskip"])
             normalized["num_steps"] = int(normalized["num_steps"])
             normalized["window_size"] = int(normalized.get("window_size", 1))
@@ -174,6 +181,8 @@ class HDF5Dataset:
             )
 
     def _load_slice_with_levels(self, ep_dix: int, start: int) -> dict:
+        if self.level1.get("strides"):
+            return self._load_strided(ep_dix, start)
         # Return the full level-1 sequence covering the largest span; the model
         # derives the higher levels from it.
         level1_steps = self._load_slice(
@@ -200,6 +209,22 @@ class HDF5Dataset:
             )
 
         return {f'{col}_level1': steps for col, steps in level1_steps.items()}
+
+    def _load_strided(self, ep_idx: int, start: int) -> dict:
+        """One level-1 clip at a stride k drawn from level1['strides'] (A21)."""
+        strides, kmax = self.level1["strides"], self.level1["frameskip"]
+        k = strides[int(torch.randint(len(strides), (1,)))]
+        n = self.level1["num_steps"]
+        steps = self._load_slice(ep_idx, start, start + n * k, frameskip=k, apply_transform=False)
+        action_dim = steps["action"].shape[-1]
+        steps["action"] = steps["action"].reshape(n, k, action_dim)
+        if self.transform:
+            steps = self.transform(steps)
+        action = torch.zeros(n, kmax, action_dim, dtype=steps["action"].dtype)
+        action[:, :k] = steps["action"]
+        stride = torch.full((n, 1), k / kmax, dtype=action.dtype)
+        steps["action"] = torch.cat([action.reshape(n, -1), stride], 1)
+        return {f"{col}_level1": v for col, v in steps.items()}
 
     def _load_slice(
         self,
