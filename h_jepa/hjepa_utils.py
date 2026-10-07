@@ -270,6 +270,10 @@ def create_world_model(cfg):
                 proprio_key="proprio" if level == 1 else "proprio_input",
             )
         else:
+            if "pixel_encoder" in encoder_cfg:  # a fusion config with use_proprio off: vision only
+                pixel_spec = encoder_cfg.pop("pixel_encoder")
+                encoder_projector_cfg = pixel_spec["projector"]
+                encoder_cfg = dict(pixel_spec["encoder"])
             base_encoder, hidden_dim = build_encoder(
                 encoder_cfg,
                 default_patch_size=cfg.patch_size,
