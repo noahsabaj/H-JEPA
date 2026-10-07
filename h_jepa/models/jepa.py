@@ -18,6 +18,7 @@ def _run_encoder(encoder, x):
 def _split_encoder_output(
     encoder_output,
     allow_cls_token: bool = True,
+    tokens: bool = False,
 ) -> torch.Tensor:
     hidden = (
         encoder_output.last_hidden_state
@@ -25,6 +26,10 @@ def _split_encoder_output(
         else encoder_output
     )
 
+    if tokens:  # token latents: every patch token, without the CLS token
+        if hidden.ndim != 3:
+            raise ValueError(f"Token latents need a (B, 1 + N, D) encoder output, got {tuple(hidden.shape)}")
+        return hidden[:, 1:]
     if hidden.ndim == 2:
         return hidden
     if hidden.ndim == 3 and allow_cls_token:
@@ -46,14 +51,17 @@ def _split_encoder_output(
 class ProjectedEncoder(nn.Module):
     """Encoder followed by its projection head."""
 
-    def __init__(self, encoder, projector=None):
+    def __init__(self, encoder, projector=None, tokens: bool = False):
         super().__init__()
         self.encoder = encoder
         self.projector = projector or nn.Identity()
+        self.tokens = bool(tokens)
 
     def forward(self, x, *, allow_cls_token: bool = True):
         output = _run_encoder(self.encoder, x)
-        hidden = _split_encoder_output(output, allow_cls_token=allow_cls_token)
+        hidden = _split_encoder_output(output, allow_cls_token=allow_cls_token, tokens=getattr(self, "tokens", False))
+        if hidden.ndim == 3:  # token latents: the projector (BatchNorm1d inside) sees one row per token
+            return self.projector(hidden.flatten(0, 1)).unflatten(0, hidden.shape[:2])
         return self.projector(hidden)
 
     def encode_info(self, info, *, key: str, allow_cls_token: bool = True):
@@ -112,8 +120,8 @@ class ProjectedPredictor(nn.Module):
 
     def forward(self, emb, act_emb):
         preds = self.predictor(emb, act_emb)
-        preds = self.projector(rearrange(preds, "b t d -> (b t) d"))
-        return rearrange(preds, "(b t) ... -> b t ...", b=emb.size(0))
+        preds = self.projector(rearrange(preds, "b t ... d -> (b t ...) d"))
+        return preds.view(*emb.shape[:-1], -1)
 
 
 class JEPA(nn.Module):
@@ -387,7 +395,7 @@ class JEPA(nn.Module):
         if "embed_0" not in _init:
             with torch.no_grad():
                 _init = self.encode(_init)
-        emb = info["embed_0"] = _init["embed_0"].unsqueeze(1).expand(B, S, -1, -1)
+        emb = info["embed_0"] = _init["embed_0"].unsqueeze(1).expand(B, S, *_init["embed_0"].shape[1:])
         _init = {k: detach_clone(v) for k, v in _init.items()}
 
         emb = rearrange(emb, "b s ... -> (b s) ...").clone()
@@ -418,7 +426,14 @@ class JEPA(nn.Module):
         return info
 
     def criterion(self, info_dict: dict):
-        """Planning cost: MSE between the last cost_last_n predicted embeddings and the goal."""
+        """Planning cost: MSE between the last cost_last_n predicted embeddings and the goal, or, when a
+        learned goal-reaching value is attached (self.value_fn(z, z_goal), larger is nearer), minus its
+        value at the last predicted embedding."""
+        value_fn = getattr(self, "value_fn", None)
+        if value_fn is not None:
+            pred_last = info_dict["predicted_embed_0"][:, :, -1]
+            goal = info_dict["goal_embed_0"][:, :, -1].expand_as(pred_last).detach()
+            return -value_fn(pred_last.flatten(0, 1), goal.flatten(0, 1)).view(pred_last.shape[:2])
         pred_emb = info_dict["predicted_embed_0"][:, :, 1:, :]
         cost_last_n = max(1, int(info_dict.get("cost_last_n", 1)))
         cost_window = min(cost_last_n, pred_emb.shape[-2])

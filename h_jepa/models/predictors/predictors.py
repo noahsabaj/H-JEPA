@@ -72,13 +72,15 @@ class _CTAttention(nn.Module):
         self.to_qkv = nn.Linear(dim, dim_head * heads * 3, bias=False)
         self.to_out = nn.Sequential(nn.Linear(dim_head * heads, dim), nn.Dropout(dropout))
 
-    def forward(self, x):
+    def forward(self, x, attn_mask=None):
         q, k, v = (
             t.view(t.shape[0], t.shape[1], self.heads, -1).transpose(1, 2)
             for t in self.to_qkv(x).chunk(3, dim=-1)
         )  # each [B, heads, T, dim_head]
         drop = self.dropout if self.training else 0.0
-        out = F.scaled_dot_product_attention(q, k, v, dropout_p=drop, is_causal=True)
+        out = F.scaled_dot_product_attention(
+            q, k, v, attn_mask=attn_mask, dropout_p=drop, is_causal=attn_mask is None
+        )
         out = out.transpose(1, 2).reshape(x.shape[0], x.shape[1], -1)  # [B, T, heads * dim_head]
         return self.to_out(out)
 
@@ -94,13 +96,16 @@ class _CTConditionalBlock(nn.Module):
         nn.init.normal_(self.adaLN_modulation[-1].weight, std=adaln_init_scale)
         nn.init.constant_(self.adaLN_modulation[-1].bias, 0)
 
-    def forward(self, x, c):
-        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (
-            self.adaLN_modulation(c).chunk(6, dim=-1)
-        )
-        x = x + gate_msa * self.attn(self.norm1(x) * (1 + scale_msa) + shift_msa)
+    def forward(self, x, c, attn_mask=None):
+        # c has one row per frame. With token latents x has N rows per frame, which share it.
+        B, L, D = x.shape
+        mod = self.adaLN_modulation(c).unsqueeze(2)  # (B, T, 1, 6D)
+        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = mod.chunk(6, dim=-1)
+        x = x.view(B, mod.size(1), -1, D)
+        h = (self.norm1(x) * (1 + scale_msa) + shift_msa).view(B, L, D)
+        x = x + gate_msa * self.attn(h, attn_mask).view_as(x)
         x = x + gate_mlp * self.mlp(self.norm2(x) * (1 + scale_mlp) + shift_mlp)
-        return x
+        return x.view(B, L, D)
 
 
 class _CTTransformer(nn.Module):
@@ -119,11 +124,11 @@ class _CTTransformer(nn.Module):
             ]
         )
 
-    def forward(self, x, c):
+    def forward(self, x, c, attn_mask=None):
         x = self.input_proj(x)
         c = self.cond_proj(c)
         for block in self.layers:
-            x = block(x, c)
+            x = block(x, c, attn_mask)
         return self.output_proj(self.norm(x))
 
 
@@ -141,12 +146,16 @@ class CausalTransformerPredictor(nn.Module):
         emb_dropout=0.0,
         predictor_dim=None,
         adaln_init_scale=0.02,
+        num_tokens=1,
     ):
         super().__init__()
+        self.num_tokens = int(num_tokens)
         self.action_embedder = nn.Sequential(
             nn.Linear(action_dim, input_dim), nn.SiLU(), nn.Linear(input_dim, input_dim)
         )
         self.pos_embedding = nn.Parameter(0.02 * torch.randn(1, max_seq_len, input_dim))
+        if self.num_tokens > 1:  # token latents: a learned position per token, added to the time position
+            self.token_pos_embedding = nn.Parameter(0.02 * torch.randn(1, 1, self.num_tokens, input_dim))
         self.emb_dropout = nn.Dropout(emb_dropout)
         self.transformer = _CTTransformer(
             input_dim=input_dim,
@@ -161,5 +170,17 @@ class CausalTransformerPredictor(nn.Module):
         )
 
     def forward(self, x, c):
-        x = self.emb_dropout(x + self.pos_embedding[:, : x.size(1)])
-        return self.transformer(x, self.action_embedder(c))
+        """x: (B, T, D), or (B, T, N, D) for token latents; c: (B, T, action_dim)."""
+        if x.ndim == 3:
+            x = self.emb_dropout(x + self.pos_embedding[:, : x.size(1)])
+            return self.transformer(x, self.action_embedder(c))
+        # Token latents: one sequence of T*N tokens; a token sees every token of its own and earlier
+        # frames (block-causal); each frame's action conditions all of that frame's tokens.
+        B, T, N, _ = x.shape
+        if N != self.num_tokens:
+            raise ValueError(f"The predictor was built for {self.num_tokens} tokens per frame, got {N}")
+        x = x + self.pos_embedding[:, :T, None] + self.token_pos_embedding[:, :, :N]
+        x = self.emb_dropout(x).flatten(1, 2)
+        frame = torch.arange(T, device=x.device).repeat_interleave(N)
+        mask = frame[:, None] >= frame[None, :]
+        return self.transformer(x, self.action_embedder(c), mask).unflatten(1, (T, N))

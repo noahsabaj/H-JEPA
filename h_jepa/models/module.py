@@ -26,7 +26,7 @@ def build_projector(projector_cfg, *, input_dim: int, output_dim: int) -> nn.Mod
         return MLP(
             input_dim=input_dim,
             output_dim=output_dim,
-            hidden_dim=2048,
+            hidden_dim=int(projector_cfg.get("hidden_dim", 2048)),
             norm_fn=nn.BatchNorm1d,
             link=str(projector_cfg.get("link", "identity")).lower(),
         )

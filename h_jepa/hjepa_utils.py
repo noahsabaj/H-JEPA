@@ -219,6 +219,7 @@ def create_world_model(cfg):
     for level in range(1, int(cfg.num_levels) + 1):
         level_cfg = cfg[f"level{level}"]
         target_length = int(level_cfg.wm.history_size) + int(level_cfg.wm.get("rollout_n", 1))
+        num_tokens = int(level_cfg.wm.get("num_tokens", 1))  # > 1: token latents (patch tokens, no CLS)
         if float(level_cfg.get("ep_idm_coeff", 0.0)) > 0:  # EP-IDM needs whole clips of horizon + 1 frames
             target_length = max(target_length, int(level_cfg.ep_idm.horizon) + 1)
         encoder_cfg = dict(level_cfg.encoder)
@@ -295,13 +296,14 @@ def create_world_model(cfg):
                     input_dim=hidden_dim,
                     output_dim=embed_dim,
                 ),
+                tokens=num_tokens > 1,
             )
         embed_dims[level] = embed_dim
 
         predictor_cfg = dict(level_cfg.predictor)
         if predictor_cfg.pop("type", None) == "causal_transformer":
             predictor_projector_cfg = predictor_cfg.pop("projector", None)
-            predictor = CausalTransformerPredictor(input_dim=embed_dim, **predictor_cfg)
+            predictor = CausalTransformerPredictor(input_dim=embed_dim, num_tokens=num_tokens, **predictor_cfg)
             if predictor_projector_cfg is not None:  # e.g. LpWM's pred_proj head with the sparse link
                 predictor = ProjectedPredictor(
                     predictor,
@@ -361,14 +363,14 @@ def create_world_model(cfg):
         if float(level_cfg.get("idm_coeff", 0.0)) > 0:
             jepa.idm_loss_fn = InverseDynamicsLoss(
                 InverseDynamicsModel(
-                    state_dim=embed_dim,
+                    state_dim=embed_dim * num_tokens,
                     hidden_dim=int(level_cfg.idm.hidden_dim),
                     action_dim=int(level_cfg.predictor.action_dim),
                 )
             )
         if float(level_cfg.get("ep_idm_coeff", 0.0)) > 0:
             jepa.ep_idm_loss_fn = EndpointInverseDynamicsLoss(
-                state_dim=embed_dim,
+                state_dim=embed_dim * num_tokens,
                 hidden_dim=int(level_cfg.ep_idm.hidden_dim),
                 action_dim=int(level_cfg.predictor.action_dim),
                 horizon=int(level_cfg.ep_idm.horizon),

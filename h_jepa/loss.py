@@ -111,7 +111,7 @@ class InverseDynamicsModel(nn.Module):
         self.apply(init_module_weights)
 
     def forward(self, state_t, state_t_plus_1):
-        return self.model(torch.cat([state_t, state_t_plus_1], dim=1))
+        return self.model(torch.cat([state_t.flatten(1), state_t_plus_1.flatten(1)], dim=1))
 
 
 class EndpointInverseDynamicsLoss(nn.Module):
@@ -143,7 +143,7 @@ class EndpointInverseDynamicsLoss(nn.Module):
             raise ValueError(f"EP-IDM needs clips of horizon + 1 = {H + 1} frames, got {emb.size(1)}")
         z0 = emb[:, :starts].flatten(0, 1)
         zH = emb[:, H : H + starts].flatten(0, 1)
-        pred = self.model(torch.cat([z0, zH], dim=1)).view(-1, H, self.action_dim)
+        pred = self.model(torch.cat([z0.flatten(1), zH.flatten(1)], dim=1)).view(-1, H, self.action_dim)
         target = torch.stack([action[:, s : s + H] for s in range(starts)], dim=1).flatten(0, 1)
         return F.mse_loss(pred, target.detach())
 
