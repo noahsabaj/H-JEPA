@@ -272,7 +272,7 @@ def run(cfg):
             "modules": str(model_name),
             "optimizer": hjepa_optimizer,
             "scheduler": scheduler,
-            "interval": "epoch",
+            "interval": "step",  # spt steps schedulers per optimizer step in manual optimization
         }
 
     data_module = spt.data.DataModule(train=train, val=val)
@@ -314,6 +314,16 @@ def run(cfg):
         logger = CSVLogger(save_dir=str(run_dir), name="lightning_logs")
 
     run_dir.mkdir(parents=True, exist_ok=True)
+    old_cfg, resume = run_dir / "config.yaml", run_dir / "lightning_resume" / "last.ckpt"
+    if old_cfg.is_file() and resume.is_file():  # resume only the same run, never a changed config under the same name
+        def _comparable(c):
+            c = OmegaConf.to_container(c, resolve=False)
+            c.pop("num_workers", None)  # machine settings may change between restarts
+            c.get("loader", {}).pop("num_workers", None)
+            return c
+        if _comparable(OmegaConf.load(old_cfg)) != _comparable(cfg):
+            raise RuntimeError(f"{resume} belongs to a different config than this run ({old_cfg}); "
+                               f"delete {run_dir} (or give the new run a new name) before training")
     with open(run_dir / "config.yaml", "w") as f:
         OmegaConf.save(cfg, f)
     normalizer_path = save_normalizer_artifact(normalizer_artifact, run_dir)
