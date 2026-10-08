@@ -29,12 +29,14 @@ class SIGReg(torch.nn.Module):
 
     def forward(self, proj):
         """
-        proj: (T, B, D)
+        proj: (T, B, D). Computed in fp32 under any autocast: in bf16, cos and sin of arguments up
+        to ~30 keep only about one digit.
         """
         A = torch.randn(proj.size(-1), self.num_proj, device=proj.device)
         A = A.div_(A.norm(p=2, dim=0))
-        x_t = (proj @ A).unsqueeze(-1) * self.t
-        cos, sin = x_t.cos().mean(-3), x_t.sin().mean(-3)
+        with torch.autocast(proj.device.type, enabled=False):
+            x_t = (proj.float() @ A).unsqueeze(-1) * self.t
+            cos, sin = x_t.cos().mean(-3), x_t.sin().mean(-3)
         n = proj.size(-2)
         if torch.distributed.is_available() and torch.distributed.is_initialized():
             # untracked by autograd: each rank backprops its local ECF, DDP's grad average
