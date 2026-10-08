@@ -387,15 +387,20 @@ class JEPA(nn.Module):
         Context frames: info pixels (B, S, T, ...) with T > 1 are the last T observed frames, and
         info["history_action"] (B, S, T - 1, A) the actions taken between them; they go before the
         planned actions. The predictor sees the last `history_size` frames (default: the model's
-        `plan_history`, set by the planner to the training history; else 1).
+        `plan_history`, set by the planner to the training history; else 1). With info["embed_0"]
+        (B, S, T, D) given, its frames are the context (a hierarchy level plans from its own latents).
         """
 
         assert "pixels" in info, "pixels not in info_dict"
+        H = info["embed_0"].size(2) if "embed_0" in info else info["pixels"].size(2)
         if "history_action" in info:
-            action_sequence = torch.cat([info["history_action"].to(action_sequence), action_sequence], dim=2)
+            hist = info["history_action"]
+            if hist.size(2) != H - 1 or hist.size(-1) != action_sequence.size(-1):
+                raise ValueError(f"history_action {tuple(hist.shape)} does not fit {H} context frames and "
+                                 f"{action_sequence.size(-1)}-d actions")
+            action_sequence = torch.cat([hist.to(action_sequence), action_sequence], dim=2)
         if history_size is None:
             history_size = getattr(self, "plan_history", 1)
-        H = info["pixels"].size(2)
         B, S, T = action_sequence.shape[:3]
         act_0, act_future = torch.split(action_sequence, [H, T - H], dim=2)
         info["action"] = act_0

@@ -137,6 +137,10 @@ class HierarchicalSolver:
 
             level_info = dict(info_dict)
             level_info['embed_0'] = obs_embeddings[f'embed_{level}']
+            if level > 1:
+                # The observed history (frames one raw step apart, raw actions between them) is
+                # level 1's; an upper level plans from the current state only.
+                level_info.pop('history_action', None)
             level_info['action_cost_weight'] = level_cfg.action_cost_weight
 
             if subgoal_latents is None:
@@ -340,7 +344,10 @@ class HierarchicalSolver:
                 )
 
                 encoded[f'embed_{level}'] = level_out['embed_0']
-                outputs[f'embed_{level}'] = level_out['embed_0'][:, -1:].detach()
+                # Level 1 keeps every observed frame (its rollout context, matching
+                # history_action); upper levels plan from the latest one.
+                latest = level_out['embed_0'] if level == 1 else level_out['embed_0'][:, -1:]
+                outputs[f'embed_{level}'] = latest.detach()
 
         return outputs
 
@@ -405,7 +412,9 @@ class LevelCostModel(nn.Module):
     def get_cost(self, info_dict: dict, action_candidates: torch.Tensor) -> torch.Tensor:
         info_dict = self.rollout(info_dict, action_candidates)
 
-        pred_emb = info_dict["predicted_embed_0"]
+        # Observed history frames before the current one are context only: drop them, so the cost
+        # and the upward projection (strided from the current frame) see current + predicted.
+        pred_emb = info_dict["predicted_embed_0"][:, :, int(info_dict.get("context_frames", 1)) - 1:]
         use_upper_space = bool(info_dict.get('goal_embed_0_in_upper_space', True))
         goal_level = int(info_dict.get('goal_embed_0_level', self.level + 1))
         action_weight = float(info_dict.get("action_cost_weight", 0.0))
@@ -419,6 +428,7 @@ class LevelCostModel(nn.Module):
 
         cost_info = dict(info_dict)
         cost_info["predicted_embed_0"] = pred_for_cost
+        cost_info["context_frames"] = 1
         cost = self.model.criterion(cost_info)
         if action_weight != 0.0:
             action_cost = self._action_cost(action_for_cost, cost_info)
