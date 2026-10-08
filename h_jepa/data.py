@@ -330,15 +330,28 @@ def run_identity(datasets, normalizer_artifact) -> dict:
     diff = _git(FORK, "diff", "HEAD")
     head = _git(FORK, "rev-parse", "HEAD")
     outer = _git(FORK, "rev-parse", "--show-superproject-working-tree")
+    if head is None:  # a copy without .git (fleet nodes get the files only): hash the Python sources
+        code = {"fork_files_sha256": fork_files_sha256()}
+    else:
+        code = {"fork_commit": head.strip(),
+                "fork_diff_sha256": diff is not None and hashlib.sha256(diff.encode()).hexdigest() or None}
     return {
         "data": data,
         "normalizer_stats_sha256": normalizer_stats_sha256(normalizer_artifact),
-        "code": {
-            "fork_commit": head and head.strip(),
-            "fork_diff_sha256": diff is not None and hashlib.sha256(diff.encode()).hexdigest() or None,
-        },
+        "code": code,
         "repo_commit": outer and (_git(Path(outer.strip()), "rev-parse", "HEAD") or "").strip() or None,
     }
+
+
+def fork_files_sha256(root: Path = FORK) -> str:
+    """One hash of the fork's Python files (paths and bytes), for copies without git."""
+    h = hashlib.sha256()
+    for p in sorted(root.rglob("*.py")):
+        if {"__pycache__", ".git", ".venv"} & set(p.relative_to(root).parts):
+            continue
+        h.update(p.relative_to(root).as_posix().encode())
+        h.update(p.read_bytes())
+    return h.hexdigest()
 
 
 def check_resume_identity(run_dir: Path, identity: dict) -> None:
