@@ -31,6 +31,8 @@ class CEMSolver(GradientSolver):
         seed: Random seed for reproducibility.
     """
 
+    MIN_STD = 1e-4  # as the GradientSolver's action prior
+
     def __init__(
         self,
         model,
@@ -126,11 +128,19 @@ class CEMSolver(GradientSolver):
                 assert costs.shape == (current_bs, self.num_samples), (
                     f'Cost should be of shape ({current_bs}, {self.num_samples}), got {tuple(costs.shape)}'
                 )
+                # a non-finite cost ranks last (topk would rank NaN anywhere); none finite is an error
+                if not torch.isfinite(costs).any(dim=1).all():
+                    raise FloatingPointError('CEM: every candidate has a non-finite cost')
+                costs = torch.where(torch.isfinite(costs), costs, torch.inf)
 
                 elite_idx = torch.topk(costs, self.topk, dim=1, largest=False).indices
                 elites = candidates[rows, elite_idx]
-                m, s = elites.mean(dim=1), elites.std(dim=1)
+                # one elite has no sample std (NaN): its std is 0, and every std is at least MIN_STD
+                m = elites.mean(dim=1)
+                s = elites.std(dim=1, unbiased=self.topk > 1).clamp_min(self.MIN_STD)
 
+            if not torch.isfinite(m).all():
+                raise FloatingPointError('CEM: the plan is not finite')
             plans.append(m.detach().cpu())
             per_env_time.extend([time.time() - batch_t0] * current_bs)
 

@@ -17,7 +17,10 @@ from torchvision.transforms import v2 as transforms
 from data import (
     IMAGENET_STATS,
     NORMALIZER_ARTIFACT_FILENAME,
+    file_fingerprint,
     load_normalizer_artifact,
+    safe_std,
+    write_text_atomic,
 )
 from eval_config_utils import _build_policy_plan_config, _is_hierarchical_solver
 from hierarchical_solver import build_hierarchical_solver
@@ -128,7 +131,7 @@ def _normalizer_artifact_to_process(artifact: dict, required_cols: list[str]) ->
     for col in required_cols:
         col_stats = stats[col]
         mean = np.asarray(col_stats["mean"], dtype=np.float64).reshape(-1)
-        scale = np.asarray(col_stats["std"], dtype=np.float64).reshape(-1)
+        scale = safe_std(np.asarray(col_stats["std"], dtype=np.float64).reshape(-1))  # as in training
 
         processor = preprocessing.StandardScaler()
         processor.mean_ = mean

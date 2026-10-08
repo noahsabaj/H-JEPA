@@ -58,6 +58,9 @@ class GradientSolver(torch.nn.Module):
         self.early_stop_patience = max(0, int(early_stop_patience))
         self.early_stop_rel_delta = max(0.0, float(early_stop_rel_delta))
         self.action_clip_sigma = action_clip_sigma
+        # Optional hard (lower, upper) bounds per action dim, e.g. the env's action limits in the
+        # solver's (normalized) units; intersected with the prior clip bounds.
+        self.action_bounds = None
         self.device = device
         self.torch_gen = torch.Generator(device=device).manual_seed(seed)
 
@@ -173,6 +176,18 @@ class GradientSolver(torch.nn.Module):
         return mean, std
 
     def _get_action_clip_bounds(self) -> tuple[torch.Tensor, torch.Tensor] | None:
+        """Per-dimension clipping bounds: the prior's, within action_bounds when those are set."""
+        bounds = self._get_prior_clip_bounds()
+        hard = getattr(self, 'action_bounds', None)
+        if hard is None:
+            return bounds
+        lo, hi = (torch.as_tensor(np.asarray(b), dtype=torch.float32, device=self.device) for b in hard)
+        if bounds is None:
+            return lo, hi
+        lower = torch.minimum(torch.maximum(bounds[0], lo), hi)
+        return lower, torch.maximum(torch.minimum(bounds[1], hi), lower)
+
+    def _get_prior_clip_bounds(self) -> tuple[torch.Tensor, torch.Tensor] | None:
         """Estimate per-dimension clipping bounds from queued latent actions."""
         if self.action_clip_sigma is not None:
             prior_stats = self._get_action_prior_stats()
@@ -404,6 +419,10 @@ class GradientSolver(torch.nn.Module):
                 final_info['cost_last_n'] = cost_last_n
                 final_info['intermediate_cost_weight'] = intermediate_cost_weight
                 final_costs = self.model.get_cost(final_info, batch_init)
+            # a non-finite cost ranks last (argsort would place NaN anywhere); none finite is an error
+            if not torch.isfinite(final_costs).any(dim=1).all():
+                raise FloatingPointError('GradientSolver: every candidate has a non-finite cost')
+            final_costs = torch.where(torch.isfinite(final_costs), final_costs, torch.inf)
 
             top_idx = torch.argsort(final_costs, dim=1)[:, 0]
             batch_indices = torch.arange(current_bs, device=batch_init.device)

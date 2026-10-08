@@ -1,3 +1,5 @@
+import hashlib
+import os
 from pathlib import Path
 
 import numpy as np
@@ -8,6 +10,66 @@ import torch
 
 NORMALIZER_ARTIFACT_FILENAME = "normalizer.pt"
 IMAGENET_STATS = dict(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+MIN_STD = 1e-6  # a column with a smaller std (constant) is centred, not scaled
+
+
+def save_atomic(obj, path) -> Path:
+    """torch.save to <path>.tmp, then rename: a reader never sees a partial file at `path`."""
+    path = Path(path)
+    tmp = path.with_name(path.name + ".tmp")
+    torch.save(obj, tmp)
+    os.replace(tmp, path)
+    return path
+
+
+def write_text_atomic(path, text: str) -> Path:
+    path = Path(path)
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(text)
+    os.replace(tmp, path)
+    return path
+
+
+def file_fingerprint(path, block: int = 1 << 20) -> dict:
+    """Cheap identity of a large file: its size and the sha256 of its first and last `block` bytes."""
+    path = Path(path)
+    size = path.stat().st_size
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        h.update(f.read(block))
+        if size > block:
+            f.seek(max(block, size - block))
+            h.update(f.read(block))
+    return {"size": size, "head_tail_sha256": h.hexdigest()}
+
+
+def safe_std(std):
+    """The z-score scale of a column: its std, or 1 where the column is constant. Training and
+    planning both normalize with (x - mean) / safe_std(std)."""
+    if torch.is_tensor(std):
+        return torch.where(std > MIN_STD, std, torch.ones_like(std))
+    std = np.asarray(std)
+    return np.where(std > MIN_STD, std, 1).astype(std.dtype)
+
+
+def check_stats(col: str, mean, std) -> None:
+    for name, v in (("mean", mean), ("std", std)):
+        if not np.isfinite(np.asarray(v, dtype=np.float64)).all():
+            raise ValueError(f"Normalizer statistics of column {col!r}: {name} is not finite ({v})")
+
+
+class ZScore:
+    """(x - mean) / safe_std(std); NaN rows (padding) become 0 unless fill_nan=False. A class, not a
+    closure, so dataset transforms pickle into spawned DataLoader workers."""
+
+    def __init__(self, mean, std, fill_nan: bool = True):
+        self.mean, self.std, self.fill_nan = mean, safe_std(std), fill_nan
+
+    def __call__(self, x):
+        x = (x - self.mean) / self.std
+        if self.fill_nan:
+            x = torch.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)
+        return x.float()
 
 
 class ColumnTransform:
@@ -112,14 +174,9 @@ def get_column_normalizer(dataset, source: str, target: str):
         data = data[~torch.isnan(data).any(dim=1)]
         mean = data.mean(0, keepdim=True).clone()
         std = data.std(0, keepdim=True).clone()
+    check_stats(source, mean, std)
 
-    def norm_fn(x):
-        x = (x - mean) / std
-        return torch.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0).float()
-
-    normalizer = ColumnTransform(norm_fn, source=source, target=target)
-
-    return normalizer
+    return ColumnTransform(ZScore(mean, std), source=source, target=target)
 
 
 def get_column_normalizer_from_artifact(
@@ -141,14 +198,7 @@ def get_column_normalizer_from_artifact(
     col_stats = stats[source]
     mean = torch.from_numpy(np.asarray(col_stats["mean"])).float()
     std = torch.from_numpy(np.asarray(col_stats["std"])).float()
-
-    def norm_fn(x):
-        x = (x - mean) / std
-        if fill_nan:
-            x = torch.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)
-        return x.float()
-
-    return ColumnTransform(norm_fn, source=source, target=target)
+    return ColumnTransform(ZScore(mean, std, fill_nan), source=source, target=target)
 
 
 def normalizer_columns_from_dataset_cfg(dataset_cfg) -> list[str]:
@@ -201,6 +251,7 @@ def build_normalizer_artifact(cfg, train_dataset) -> dict:
     stats = {}
     for col in normalizer_columns_from_dataset_cfg(dataset_cfg):
         mean, std, count = _column_mean_std(train_dataset, col)
+        check_stats(col, mean, std)
         stats[col] = {
             "mean": mean.astype(np.float32),
             "std": std.astype(np.float32),
@@ -219,9 +270,19 @@ def build_normalizer_artifact(cfg, train_dataset) -> dict:
 
 
 def save_normalizer_artifact(artifact: dict, run_dir: str | Path) -> Path:
-    path = Path(run_dir) / NORMALIZER_ARTIFACT_FILENAME
-    torch.save(artifact, path)
-    return path
+    return save_atomic(artifact, Path(run_dir) / NORMALIZER_ARTIFACT_FILENAME)
+
+
+def normalizer_stats_sha256(artifact: dict) -> str:
+    """Hash of a normalizer artifact's statistics (mean, std, count of every column)."""
+    h = hashlib.sha256()
+    for col in sorted(artifact["stats"]):
+        s = artifact["stats"][col]
+        h.update(col.encode())
+        for k in ("mean", "std"):
+            h.update(np.ascontiguousarray(np.asarray(s[k], dtype=np.float32)).tobytes())
+        h.update(str(int(s.get("count", 0))).encode())
+    return h.hexdigest()
 
 
 def load_normalizer_artifact(path: str | Path) -> dict:
@@ -234,4 +295,6 @@ def load_normalizer_artifact(path: str | Path) -> dict:
         )
     if not isinstance(artifact.get("stats"), dict):
         raise ValueError("Normalizer artifact is missing a 'stats' dictionary.")
+    for col, s in artifact["stats"].items():
+        check_stats(col, s["mean"], s["std"])
     return artifact

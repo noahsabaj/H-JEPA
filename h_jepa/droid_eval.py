@@ -37,7 +37,7 @@ import torch
 from omegaconf import DictConfig, OmegaConf
 from torchvision.transforms import v2 as transforms
 
-from data import IMAGENET_STATS
+from data import IMAGENET_STATS, save_atomic, safe_std, write_text_atomic
 from eval_config_utils import _build_policy_plan_config
 from planning_eval import (
     _load_policy_normalizer_artifact,
@@ -142,7 +142,7 @@ def run_clip_eval(cfg: DictConfig, model=None, results_dir: str | Path | None = 
     model = load_model(cfg, model)
     action_stats = _load_policy_normalizer_artifact(cfg)["stats"]["action"]
     act_mean = np.asarray(action_stats["mean"]).reshape(-1)  # [A]
-    act_std = np.asarray(action_stats["std"]).reshape(-1)  # [A]
+    act_std = safe_std(np.asarray(action_stats["std"]).reshape(-1))  # [A], as in training
     action_dim = act_mean.shape[0]
 
     solver = build_solver(cfg, model)
