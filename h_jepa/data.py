@@ -1,7 +1,10 @@
 import hashlib
+import json
 import os
+import subprocess
 from pathlib import Path
 
+from loguru import logger
 import numpy as np
 from omegaconf import OmegaConf
 import stable_worldmodel as swm
@@ -298,3 +301,66 @@ def load_normalizer_artifact(path: str | Path) -> dict:
     for col, s in artifact["stats"].items():
         check_stats(col, s["mean"], s["std"])
     return artifact
+
+
+# Run identity: what a resume must share with the run it continues (main_hjepa.py).
+
+RUN_IDENTITY = "run_identity.json"
+FORK = Path(__file__).resolve().parents[1]
+
+
+def _git(repo: Path, *args: str) -> str | None:
+    try:
+        r = subprocess.run(["git", "-C", str(repo), *args], capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return r.stdout if r.returncode == 0 else None
+
+
+def run_identity(datasets, normalizer_artifact) -> dict:
+    """What a resume must share with the run it continues: the data files (size, hash of the first
+    and last MB), the normalizer statistics and the training code (this fork's commit and uncommitted
+    diff). The commit of the repo around the fork is recorded, not compared: its commits are mostly
+    records, and the training config is compared on its own."""
+    data = {}
+    for ds in datasets:
+        path = getattr(ds, "h5_path", None)
+        if path is not None and Path(path).is_file():
+            data[Path(path).name] = file_fingerprint(path)  # by name: HJEPA_HOME may move
+    diff = _git(FORK, "diff", "HEAD")
+    head = _git(FORK, "rev-parse", "HEAD")
+    outer = _git(FORK, "rev-parse", "--show-superproject-working-tree")
+    return {
+        "data": data,
+        "normalizer_stats_sha256": normalizer_stats_sha256(normalizer_artifact),
+        "code": {
+            "fork_commit": head and head.strip(),
+            "fork_diff_sha256": diff is not None and hashlib.sha256(diff.encode()).hexdigest() or None,
+        },
+        "repo_commit": outer and (_git(Path(outer.strip()), "rev-parse", "HEAD") or "").strip() or None,
+    }
+
+
+def check_resume_identity(run_dir: Path, identity: dict) -> None:
+    """Refuse a resume whose data, normalizer or code differ from the run's (HJEPA_RESUME_CODE_CHANGE=1
+    accepts a code change, e.g. a fix that does not change the recipe; it is logged)."""
+    saved_norm = run_dir / NORMALIZER_ARTIFACT_FILENAME
+    if saved_norm.is_file():
+        saved = normalizer_stats_sha256(load_normalizer_artifact(saved_norm))
+        if saved != identity["normalizer_stats_sha256"]:
+            raise RuntimeError(f"{run_dir}: the data's normalizer statistics differ from the run's saved "
+                               f"{saved_norm} (data rebuilt?); train a new version instead of resuming")
+    path = run_dir / RUN_IDENTITY
+    if not path.is_file():
+        logger.warning(f"{path} missing (a run started before identity records): data and code unchecked")
+        return
+    old = json.loads(path.read_text())
+    for key in ("data", "normalizer_stats_sha256"):
+        if old.get(key) != identity[key]:
+            raise RuntimeError(f"{run_dir}: {key} differs from the run's ({path}):\n  run: {old.get(key)}\n"
+                               f"  now: {identity[key]}\ntrain a new version instead of resuming")
+    if old.get("code") != identity["code"]:
+        msg = f"{run_dir}: training code differs from the run's: {old.get('code')} -> {identity['code']}"
+        if os.environ.get("HJEPA_RESUME_CODE_CHANGE") != "1":
+            raise RuntimeError(msg + "\nset HJEPA_RESUME_CODE_CHANGE=1 to resume anyway (recipe unchanged)")
+        logger.warning(msg + " (HJEPA_RESUME_CODE_CHANGE=1)")

@@ -46,8 +46,9 @@ class SIGReg(torch.nn.Module):
                 torch.distributed.all_reduce(ecf)
                 ecf.data.div_(world_size)
             n = n * world_size
-        err = (cos - self.phi).square() + sin.square()
-        statistic = (err @ self.weights) * n
+        with torch.autocast(proj.device.type, enabled=False):  # the integral too: bf16 would round it
+            err = (cos - self.phi).square() + sin.square()
+            statistic = (err @ self.weights) * n
         return statistic.mean()
 
 

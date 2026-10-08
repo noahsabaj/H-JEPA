@@ -1,4 +1,5 @@
 import importlib
+import json
 import os
 
 os.environ.setdefault('MUJOCO_GL', 'egl')  # osmesa on GPUs without graphics (AMD Instinct)
@@ -24,11 +25,15 @@ from utils import (
 )
 from final_probing_decoding_eval import FinalProbingDecodingEvalCallback
 from data import (
+    RUN_IDENTITY,
     Compose,
     build_normalizer_artifact,
     build_hdf5_dataset,
+    check_resume_identity,
     get_column_normalizer,
+    run_identity,
     save_normalizer_artifact,
+    write_text_atomic,
 )
 
 # uuid
@@ -202,6 +207,9 @@ def run(cfg):
     #########################
 
     _configure_runtime_performance()
+    # Seed torch, numpy and random before the datasets, models and losses are built: the initial
+    # weights are then a function of cfg.seed (the manager seeds again before training).
+    pl.seed_everything(int(cfg.seed), workers=True)
 
     cache_dir = os.environ.get("HJEPA_HOME", None)
 
@@ -320,6 +328,7 @@ def run(cfg):
 
     run_dir.mkdir(parents=True, exist_ok=True)
     old_cfg, resume = run_dir / "config.yaml", run_dir / "lightning_resume" / "last.ckpt"
+    identity = run_identity([train_dataset, val_dataset], normalizer_artifact)
     if old_cfg.is_file() and resume.is_file():  # resume only the same run, never a changed config under the same name
         def _comparable(c):
             c = OmegaConf.to_container(c, resolve=False)
@@ -329,10 +338,13 @@ def run(cfg):
         if _comparable(OmegaConf.load(old_cfg)) != _comparable(cfg):
             raise RuntimeError(f"{resume} belongs to a different config than this run ({old_cfg}); "
                                f"delete {run_dir} (or give the new run a new name) before training")
-    with open(run_dir / "config.yaml", "w") as f:
-        OmegaConf.save(cfg, f)
-    normalizer_path = save_normalizer_artifact(normalizer_artifact, run_dir)
-    logging.info(f"Saved training normalizer artifact to {normalizer_path}")
+        check_resume_identity(run_dir, identity)  # raises before any run file changes
+        logging.info(f"Resuming {run_dir}: same config, data, normalizer and code; keeping its saved files")
+    else:
+        write_text_atomic(run_dir / "config.yaml", OmegaConf.to_yaml(cfg))
+        normalizer_path = save_normalizer_artifact(normalizer_artifact, run_dir)
+        write_text_atomic(run_dir / RUN_IDENTITY, json.dumps(identity, indent=1))
+        logging.info(f"Saved training normalizer artifact to {normalizer_path}")
 
     lr_callback = pl.pytorch.callbacks.LearningRateMonitor(logging_interval="step")
     object_dump_callback = ModelObjectCallBack(

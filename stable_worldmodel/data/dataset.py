@@ -1,6 +1,7 @@
 """Dataset classes for episode-based reinforcement learning data."""
 
 import logging
+import os
 from pathlib import Path
 import re
 from typing import Any
@@ -42,6 +43,7 @@ class HDF5Dataset:
     ) -> None:
         self.h5_path = Path(cache_dir or get_cache_dir(), f'{name}.h5')
         self.h5_file: h5py.File | None = None
+        self._h5_pid: int | None = None  # the process that opened h5_file
         self._cache: dict[str, np.ndarray] = {}
 
         with h5py.File(self.h5_path, 'r') as f:
@@ -179,10 +181,23 @@ class HDF5Dataset:
         return chunk
 
     def _open(self) -> None:
-        if self.h5_file is None:
+        # One handle per process: a DataLoader worker (forked or spawned) opens its own.
+        if self.h5_file is None or self._h5_pid != os.getpid():
             self.h5_file = h5py.File(
                 self.h5_path, 'r', swmr=True, rdcc_nbytes=256 * 1024 * 1024
             )
+            self._h5_pid = os.getpid()
+
+    def close(self) -> None:
+        if self.h5_file is not None and self._h5_pid == os.getpid():
+            self.h5_file.close()
+        self.h5_file, self._h5_pid = None, None
+
+    def __getstate__(self) -> dict:
+        # h5py handles do not pickle (spawned workers): a worker reopens the file on first read.
+        state = self.__dict__.copy()
+        state['h5_file'], state['_h5_pid'] = None, None
+        return state
 
     def _load_slice_with_levels(self, ep_dix: int, start: int) -> dict:
         if self.level1.get("strides"):

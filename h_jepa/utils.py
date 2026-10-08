@@ -5,6 +5,8 @@ from pathlib import Path
 from lightning.pytorch.callbacks import Callback
 from omegaconf import OmegaConf
 
+from data import save_atomic
+
 
 def resolve_model_checkpoint_path(run_name: str, cache_dir: str | None):
     """Resolve a run name/path to an on-disk *_object.ckpt path."""
@@ -153,7 +155,7 @@ class ModelObjectCallBack(Callback):
         if self._saved_final or not trainer.is_global_zero:
             return
         path = self.dirpath / f'{self.filename}_object.ckpt'
-        torch.save(pl_module.model, path)
+        save_atomic(pl_module.model, path)  # <path>.tmp, then rename: a waiter never sees a partial file
         self._saved_final = True
         logging.info(f'Saved final world model to {path}')
 
@@ -163,7 +165,7 @@ class ModelObjectCallBack(Callback):
         epoch = trainer.current_epoch + 1
         if epoch % self.epoch_interval == 0:
             path = self.dirpath / f'{self.filename}_epoch_{epoch}_object.ckpt'
-            torch.save(pl_module.model, path)
+            save_atomic(pl_module.model, path)
             logging.info(f'Saved world model to {path}')
         if epoch == trainer.max_epochs:
             self._save_final(trainer, pl_module)

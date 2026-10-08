@@ -21,6 +21,8 @@ from data import (
     build_hdf5_dataset,
     get_column_normalizer_from_artifact,
     load_normalizer_artifact,
+    save_atomic,
+    write_text_atomic,
 )
 from models.module import CLSDecoder
 from models.probers import build_prober
@@ -546,7 +548,7 @@ def _save_artifacts(heads, output_dir: Path, cfg, metrics) -> None:
     for name, module in heads.decoders.items():
         meta = heads.decoder_metadata[name]
         level = int(meta["level"])
-        torch.save(
+        save_atomic(
             {
                 "format": "final_probing_decoding_eval_decoder_v1",
                 "level": level,
@@ -558,8 +560,8 @@ def _save_artifacts(heads, output_dir: Path, cfg, metrics) -> None:
             },
             output_dir / f"decoder_level{level}.ckpt",
         )
-    OmegaConf.save(cfg, output_dir / "config.yaml")
-    OmegaConf.save(OmegaConf.create(metrics), output_dir / "metrics.yaml")
+    write_text_atomic(output_dir / "config.yaml", OmegaConf.to_yaml(cfg))
+    write_text_atomic(output_dir / "metrics.yaml", OmegaConf.to_yaml(OmegaConf.create(metrics)))  # last: marks done
 
 
 def _init_wandb(cfg, output_dir: Path):
