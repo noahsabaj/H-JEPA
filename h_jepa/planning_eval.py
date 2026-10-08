@@ -94,9 +94,34 @@ def get_dataset(cfg, dataset_name):
 
 
 def save_eval_config(results_dir: Path, cfg: DictConfig) -> Path:
-    config_path = results_dir / "eval_config.yaml"
-    config_path.write_text(OmegaConf.to_yaml(cfg, resolve=True))
-    return config_path
+    claim_results_dir(results_dir, cfg)
+    return write_text_atomic(results_dir / "eval_config.yaml", OmegaConf.to_yaml(cfg, resolve=True))
+
+
+EVAL_SIGNATURE = "eval_signature.json"
+
+
+def claim_results_dir(results_dir: Path, cfg: DictConfig, ignore: tuple = ()) -> None:
+    """A results dir holds one eval. Its signature (resolved config without the `ignore` keys,
+    checkpoint size and hash) is written on first use; an eval with another signature refuses to
+    reuse or mix with its cached results (chunks, clips) instead of relabelling them."""
+    import json
+
+    try:
+        ckpt = resolve_model_checkpoint_path(cfg.policy, cfg.get("cache_dir"))
+        policy = file_fingerprint(ckpt) if Path(ckpt).is_file() else None
+    except Exception:  # no checkpoint file (a model passed in by the training callback)
+        policy = None
+    config = {k: v for k, v in OmegaConf.to_container(cfg, resolve=True).items() if k not in ignore}
+    sig = json.loads(json.dumps({"config": config, "policy": policy},
+                                sort_keys=True, default=str))
+    path = Path(results_dir) / EVAL_SIGNATURE
+    if path.exists():
+        if json.loads(path.read_text()) != sig:
+            raise RuntimeError(f"{results_dir} holds results of another eval (config or checkpoint differ; "
+                               f"see {path}): give this eval a new output dir")
+        return
+    write_text_atomic(path, json.dumps(sig, indent=1, sort_keys=True))
 
 
 def resolve_results_dir(
@@ -410,7 +435,7 @@ def _run_chunked_eval(
         "evaluation_time": sum(c["evaluation_time"] for c in chunks),
         "chunk_size": chunk_size,
     }
-    (results_dir / "metrics.yaml").write_text(OmegaConf.to_yaml(metrics_to_save))
+    write_text_atomic(results_dir / "metrics.yaml", OmegaConf.to_yaml(metrics_to_save))
     print(metrics_to_save)
     solve_records = [r for c in chunks for r in c["solve_records"]]
     if solve_records:
@@ -520,7 +545,7 @@ def run_planning_eval(
     metrics_to_save["evaluation_time"] = end_time - start_time
 
     metrics_path = resolved_results_dir / "metrics.yaml"
-    metrics_path.write_text(OmegaConf.to_yaml(metrics_to_save))
+    write_text_atomic(metrics_path, OmegaConf.to_yaml(metrics_to_save))
     print(metrics)
 
     # Per-solve GD compute metadata (level, horizon, num_samples, per-env n_iters,

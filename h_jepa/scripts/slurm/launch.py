@@ -2,7 +2,7 @@
 
   python scripts/slurm/launch.py train --config-name cube_lewm --sweep crop_ab [--seeds 42,43,44] \\
       [--grid level1.wm.history_size=3,7 ...] [--into <sweep_dir>] [hydra overrides ...]
-  python scripts/slurm/launch.py resume <run_dir> [hydra overrides, e.g. trainer.max_epochs=100]
+  python scripts/slurm/launch.py resume <run_dir> [num_workers=N loader.num_workers=N]
   python scripts/slurm/launch.py eval <sweep_dir|run_dir> [--epochs all|last|N,M] [eval.py overrides]
   common flags: --partition P --account A --qos Q --time HH:MM:SS --gpus N --mem 200G --dry
 
@@ -11,10 +11,14 @@ train   One job per (grid cell x seed) in $HJEPA_HOME/ckpts/<env>/<sweep>_<YYYY-
         (git ls-files -co --exclude-standard) is copied once to <sweep_dir>/code (+ GIT_COMMIT, GIT_STATUS,
         UNCOMMITTED.diff); every job of the sweep, its resumes and --into additions run from that copy.
 resume  Relaunch one run from its saved config.yaml; training restarts from lightning_resume/last.ckpt.
+        Only num_workers may change (main_hjepa.py refuses any other config change, and a changed GPU
+        count changes trainer.devices); a longer or changed run is a new version (MODELS.md).
 eval    One job per <run>/<name>_epoch_<N>_object.ckpt under the target: eval.py --config-name <env>_{flat|l<n>},
-        planner seed = model seed -> <run>/eval_epoch/epoch_<N>/ (metrics.yaml; DROID: eval.csv). Evals run from
+        planner seed = model seed -> <run>/eval_epoch/epoch_<N>/ (metrics.yaml; DROID: eval.csv; launch_eval.json:
+        the eval's config, seed, ckpt and overrides; a done eval with others is refused). Evals run from
         <sweep_dir>/eval_code, frozen from the worktree at the sweep's first eval (mv it aside to refresh).
 Every check (config composes, datasets exist, no live job, fresh dirs absent) runs before any sbatch.
+A rejected submission makes the command exit nonzero (after recording the ones that went through).
 Cluster settings: scripts/slurm/default.yaml < local.yaml < flags. Jobs requeue on preemption, append to
 <run_dir>/slurm/%x_%j.out and run the code copy's main_hjepa.py (srun, one task per GPU) or eval.py.
 """
@@ -144,6 +148,21 @@ def done_file(config: str, out: Path) -> Path:
     return out / ("eval.csv" if config.startswith("droid") else "metrics.yaml")
 
 
+def eval_args(config: str, seed, ckpt, overrides: list) -> dict:
+    return {"config": config, "seed": str(seed), "ckpt": str(ckpt), "overrides": list(overrides)}
+
+
+def same_eval(out: Path, args: dict) -> bool | None:
+    """Whether out/launch_eval.json records these eval args (None: no record, an eval from before them)."""
+    f = out / "launch_eval.json"
+    return json.loads(f.read_text()) == args if f.exists() else None
+
+
+def check_submitted(ids: dict) -> None:
+    if failed := [k for k, v in ids.items() if v is None]:
+        die(f"{len(failed)} of {len(ids)} submissions failed: {failed}")
+
+
 def run_job(code: str, mode: str, args: list) -> None:
     """Job body: the code copy's `train <main_hjepa.py args>` or `eval <config|seed|ckpt|outdir>... -- <overrides>`."""
     os.chdir(f"{code}/h_jepa")
@@ -159,9 +178,18 @@ def run_job(code: str, mode: str, args: list) -> None:
         os.execvp("srun", ["srun", sys.executable, "main_hjepa.py", *args])
     specs, ov, rc = args[: args.index("--")], args[args.index("--") + 1 :], 0
     for config, seed, ckpt, out in (spec.split("|") for spec in specs):
-        if not done_file(config, Path(out)).exists():
-            rc |= subprocess.run([sys.executable, "eval.py", "--config-name", config, f"seed={seed}", f"policy={ckpt}",
-                                  f"output.dir={out}", f"hydra.run.dir={out}/hydra", *ov]).returncode != 0  # fmt: skip
+        args = eval_args(config, seed, ckpt, ov)
+        if done_file(config, Path(out)).exists():
+            if same_eval(Path(out), args) is False:  # done, but with other settings: never relabel it
+                print(f"ERROR: {out} holds an eval with other settings than {args}", flush=True)
+                rc = 1
+            continue
+        Path(out).mkdir(parents=True, exist_ok=True)
+        tmp = Path(out) / "launch_eval.json.tmp"
+        tmp.write_text(json.dumps(args, indent=1))
+        os.replace(tmp, Path(out) / "launch_eval.json")
+        rc |= subprocess.run([sys.executable, "eval.py", "--config-name", config, f"seed={seed}", f"policy={ckpt}",
+                              f"output.dir={out}", f"hydra.run.dir={out}/hydra", *ov]).returncode != 0  # fmt: skip
     sys.exit(rc)
 
 
@@ -194,12 +222,14 @@ def cmd_train(a, overrides: list) -> None:
     toks = [key_token(k) for k, _ in grid]
     if len(set(toks)) < len(toks):
         toks = [safe(k.lstrip("+~")) + "-" for k, _ in grid]
+    cfg_dir = H / "config/train"
     if a.into:
         sweep_dir = Path(a.into).resolve()
         if not (sweep_dir / "code/GIT_COMMIT").exists():
             die(f"--into {sweep_dir}: not a launch.py sweep dir (no code/GIT_COMMIT)")
+        cfg_dir = sweep_dir / "code/h_jepa/config/train"  # the jobs run the snapshot: check its configs
     else:
-        env = compose_cfg(H / "config/train", a.config_name, overrides).env
+        env = compose_cfg(cfg_dir, a.config_name, overrides).env
         sweep_dir = home / "ckpts" / env / f"{a.sweep}_{datetime.now():%Y-%m-%d_%H-%M}"
         if sweep_dir.exists():
             die(f"{sweep_dir} exists (launched this minute already?): wait a minute or use --into")
@@ -214,7 +244,7 @@ def cmd_train(a, overrides: list) -> None:
                   f"trainer.devices={c.gpus_per_node}"]  # fmt: skip
             if run_dir.exists():
                 die(f"{run_dir} exists: a fresh train would silently resume it; use `resume` or a new sweep")
-            cfg = compose_cfg(H / "config/train", a.config_name, ov)
+            cfg = compose_cfg(cfg_dir, a.config_name, ov)
             check_datasets(cfg, home)
             if cfg.wandb.enabled:
                 ov += [f"++wandb.config.group={a.sweep}", f"++wandb.config.name={cell}_s{s}"]
@@ -234,6 +264,7 @@ def cmd_train(a, overrides: list) -> None:
         commit = (code / "GIT_COMMIT").read_text().strip()
         record(sweep_dir, {"cmd": "train", "config_name": a.config_name, "overrides": overrides, "grid": dict(grid),
                            "seeds": a.seeds, "jobs": ids, "snapshot_commit": commit})
+        check_submitted(ids)
 
 
 def cmd_resume(a, overrides: list) -> None:
@@ -255,11 +286,24 @@ def cmd_resume(a, overrides: list) -> None:
     dev = OmegaConf.select(saved, "trainer.devices")
     gpus = a.gpus or (dev if isinstance(dev, int) else int(c.gpus_per_node))
     ov = [*overrides, f"trainer.devices={gpus}", f"hydra.run.dir={rd}/hydra"]
-    compose_cfg(rd, "config", ov)
+    new, old = comparable(compose_cfg(rd, "config", ov)), comparable(saved)
+    if new != old:
+        changed = sorted(k for k in {*new, *old} if new.get(k) != old.get(k))
+        die(f"resume changes {changed} of {rd}/config.yaml; training refuses any change but num_workers "
+            f"(--gpus must match trainer.devices={dev}): a changed run is a new version")
     jid = submit(c, home, f"hj_resume_{saved.output_model_name}_s{saved.seed}", rd / "slurm", gpus, code,
                  ["train", "--config-path", str(rd), "--config-name", "config", *ov], a.dry)  # fmt: skip
     if not a.dry:
         record(rd, {"cmd": "resume", "overrides": overrides, "jobs": {str(rd): jid}, "code": str(code)})
+        check_submitted({str(rd): jid})
+
+
+def comparable(cfg: OmegaConf) -> dict:
+    """The config as main_hjepa.py's resume guard compares it: without the worker counts."""
+    c = OmegaConf.to_container(cfg, resolve=False)
+    c.pop("num_workers", None)
+    c.get("loader", {}).pop("num_workers", None)
+    return c
 
 
 def env_of(cfg: OmegaConf) -> str:  # runs made before the train configs had an `env` key fall back
@@ -291,6 +335,8 @@ def cmd_eval(a, overrides: list) -> None:
         for e in want:
             out, name = rd / "eval_epoch" / f"epoch_{e}", f"ev_{run}_e{e}"
             done = done_file(ecfg, out).exists()
+            if done and e in eps and same_eval(out, eval_args(ecfg, seed, eps[e], overrides)) is False:
+                die(f"{out} holds an eval with other settings (launch_eval.json): use a new output dir")
             why = "missing" if e not in eps else "done" if done else name in active and "active"
             if why:
                 ndone += done
@@ -318,6 +364,7 @@ def cmd_eval(a, overrides: list) -> None:
         ids[name] = submit(c, home, name, rd / "slurm", 1, code, ["eval", spec, "--", *overrides], a.dry)
     if not a.dry:
         record(root, {"cmd": "eval", "epochs": a.epochs, "overrides": overrides, "jobs": ids, "code": str(code)})
+        check_submitted(ids)
 
 
 def main() -> None:

@@ -27,6 +27,7 @@ skips the clips already saved and gives the same result as one unbroken run.
 """
 
 import csv
+import io
 import json
 import time
 from pathlib import Path
@@ -41,6 +42,7 @@ from data import IMAGENET_STATS, save_atomic, safe_std, write_text_atomic
 from eval_config_utils import _build_policy_plan_config
 from planning_eval import (
     _load_policy_normalizer_artifact,
+    claim_results_dir,
     build_solver,
     load_model,
     pop_solve_records,
@@ -151,6 +153,8 @@ def run_clip_eval(cfg: DictConfig, model=None, results_dir: str | Path | None = 
         n_envs=1,
         config=_build_policy_plan_config(cfg),
     )
+    # the clips already saved here were planned with this config (clip jobs of one eval share the dir)
+    claim_results_dir(out_dir, cfg, ignore=("start_index", "num_eval"))
     OmegaConf.save(cfg, out_dir / "plan_config.yaml", resolve=True)
     print(f"clips {clip_ids.start}..{clip_ids.stop - 1} of {len(ds)} | ckpt={cfg.policy}")
 
@@ -175,7 +179,7 @@ def run_clip_eval(cfg: DictConfig, model=None, results_dir: str | Path | None = 
         }
         ep_dir.mkdir(exist_ok=True)
         (ep_dir / "planning_compute.json").write_text(json.dumps(pop_solve_records(solver)))
-        torch.save(ep, ep_dir / "actions.pt")  # written last: marks the clip done
+        save_atomic(ep, ep_dir / "actions.pt")  # written last: marks the clip done
         m = clip_metrics(**ep)
         print(
             f"ep {k:02d}: ate_xyz={m['ate/end_distance_xyz']:.4f}m "
@@ -183,10 +187,11 @@ def run_clip_eval(cfg: DictConfig, model=None, results_dir: str | Path | None = 
         )
 
     agg = aggregate(out_dir)
-    with open(out_dir / "eval.csv", "w", newline="") as f:
-        writer = csv.writer(f)
-        writer.writerow(list(agg))
-        writer.writerow(list(agg.values()))
+    rows = io.StringIO()
+    writer = csv.writer(rows)
+    writer.writerow(list(agg))
+    writer.writerow(list(agg.values()))
+    write_text_atomic(out_dir / "eval.csv", rows.getvalue())  # the launcher's done marker
     print(f"{agg['n_episodes']} episodes in {out_dir} ({time.time() - t0:.1f}s)")
     print(f"ATE end_distance_xyz: {agg['ate/end_distance_xyz']:.4f} m")
     print(f"Frechet skill mean: {agg['frechet/skill_mean']:.4f}")
