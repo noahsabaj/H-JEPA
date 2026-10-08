@@ -56,11 +56,15 @@ class HDF5Dataset:
 
         self._setup_levels(level1, **level_kwargs)
 
+        # strided clips (A21): a start needs only the smallest stride's span; _load_strided draws
+        # among the strides that fit, so stride-1 clips use every start, not only those 110 steps from the end
+        span = (self.level1['num_steps'] * min(self.level1['strides'])
+                if self.level1.get('strides') else self.last_level['span'])
         self.clip_indices = [
             (ep, start)
             for ep, length in enumerate(self.lengths)
-            if length >= self.last_level['span']
-            for start in range(length - self.last_level['span'] + 1)
+            if length >= span
+            for start in range(length - span + 1)
         ]
 
         self.transform = None
@@ -84,7 +88,7 @@ class HDF5Dataset:
             if not isinstance(normalized, dict):
                 raise TypeError(f"{level_name} must be a mapping")
 
-            if normalized.get("strides"):  # spans and clip starts are set by the largest stride
+            if normalized.get("strides"):  # strides replace the base config's frameskip: it becomes the largest stride
                 normalized["strides"] = [int(k) for k in normalized["strides"]]
                 normalized["frameskip"] = max(normalized["strides"])
             normalized["frameskip"] = int(normalized["frameskip"])
@@ -211,10 +215,10 @@ class HDF5Dataset:
         return {f'{col}_level1': steps for col, steps in level1_steps.items()}
 
     def _load_strided(self, ep_idx: int, start: int) -> dict:
-        """One level-1 clip at a stride k drawn from level1['strides'] (A21)."""
-        strides, kmax = self.level1["strides"], self.level1["frameskip"]
+        """One level-1 clip at a stride k drawn from the level1['strides'] that fit before the episode end (A21)."""
+        kmax, n = self.level1["frameskip"], self.level1["num_steps"]
+        strides = [k for k in self.level1["strides"] if start + n * k <= self.lengths[ep_idx]]
         k = strides[int(torch.randint(len(strides), (1,)))]
-        n = self.level1["num_steps"]
         steps = self._load_slice(ep_idx, start, start + n * k, frameskip=k, apply_transform=False)
         action_dim = steps["action"].shape[-1]
         steps["action"] = steps["action"].reshape(n, k, action_dim)

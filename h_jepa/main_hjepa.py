@@ -123,6 +123,11 @@ def _build_hjepa_optimizer_factory(model, cfg):
     optimizer_cfg.pop("warmup_steps", None)
 
     def optimizer_factory(params):
+        opt_lr = cfg.optimizer.get("lr")
+        for level in range(1, int(cfg.num_levels) + 1):  # each group takes level{N}.lr; optimizer.lr is not used
+            if opt_lr is not None and float(opt_lr) != float(cfg[f"level{level}"].lr):
+                raise ValueError(f"optimizer.lr={opt_lr} differs from level{level}.lr={cfg[f'level{level}'].lr}: "
+                                 f"the optimizer uses level{level}.lr; set that one")
         param_groups = []
         for level in range(1, int(cfg.num_levels) + 1):
             level_params = [
@@ -360,6 +365,9 @@ def run(cfg):
     )
 
     resume_file = run_dir / "lightning_resume" / "last.ckpt"
+    if resume_file.is_file():  # a resume restarts the data loader: give it a new order, not epoch 0's again
+        step = torch.load(resume_file, map_location="cpu", weights_only=False).get("global_step", 0)
+        rnd_gen.manual_seed(int(cfg.seed) + 1 + int(step))
     resume_every = cfg.get("resume_every_n_steps", 2000)
     resume_callbacks = [ResumeCheckpoint(resume_file, resume_every)] if resume_every else []
     spt.set(requeue_checkpoint=not resume_every)  # lightning_resume/ already holds the full state
@@ -379,17 +387,12 @@ def run(cfg):
         enable_checkpointing=False,
     )
 
-    manager_ckpt_path = run_dir / f"{cfg.output_model_name}_weights.ckpt"
-    if cfg.get("quick_debug", False) or not manager_ckpt_path.exists():
-        manager_ckpt_path = None
-
     manager = ResumableManager(
         resume_file=resume_file if resume_every else None,
         trainer=trainer,
         module=world_model,
         data=data_module,
         seed=cfg.seed,
-        ckpt_path=manager_ckpt_path,
     )
 
     manager()

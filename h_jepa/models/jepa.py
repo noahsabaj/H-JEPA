@@ -381,10 +381,20 @@ class JEPA(nn.Module):
             pred_input = torch.cat([emb[:, :1], predicted[:, 1:T].detach()], dim=1)
         return torch.stack(passes)
 
-    def rollout(self, info, action_sequence, history_size: int = 1):
-        """Rollout the model given an initial info dict and action sequence."""
+    def rollout(self, info, action_sequence, history_size: int | None = None):
+        """Rollout the model given an initial info dict and action sequence.
+
+        Context frames: info pixels (B, S, T, ...) with T > 1 are the last T observed frames, and
+        info["history_action"] (B, S, T - 1, A) the actions taken between them; they go before the
+        planned actions. The predictor sees the last `history_size` frames (default: the model's
+        `plan_history`, set by the planner to the training history; else 1).
+        """
 
         assert "pixels" in info, "pixels not in info_dict"
+        if "history_action" in info:
+            action_sequence = torch.cat([info["history_action"].to(action_sequence), action_sequence], dim=2)
+        if history_size is None:
+            history_size = getattr(self, "plan_history", 1)
         H = info["pixels"].size(2)
         B, S, T = action_sequence.shape[:3]
         act_0, act_future = torch.split(action_sequence, [H, T - H], dim=2)
@@ -422,6 +432,7 @@ class JEPA(nn.Module):
 
         pred_rollout = rearrange(emb, "(b s) ... -> b s ...", b=B, s=S)
         info["predicted_embed_0"] = pred_rollout
+        info["context_frames"] = H  # the first H frames are observed, not predicted
 
         return info
 
@@ -434,7 +445,7 @@ class JEPA(nn.Module):
             pred_last = info_dict["predicted_embed_0"][:, :, -1]
             goal = info_dict["goal_embed_0"][:, :, -1].expand_as(pred_last).detach()
             return -value_fn(pred_last.flatten(0, 1), goal.flatten(0, 1)).view(pred_last.shape[:2])
-        pred_emb = info_dict["predicted_embed_0"][:, :, 1:, :]
+        pred_emb = info_dict["predicted_embed_0"][:, :, int(info_dict.get("context_frames", 1)):, :]
         cost_last_n = max(1, int(info_dict.get("cost_last_n", 1)))
         cost_window = min(cost_last_n, pred_emb.shape[-2])
 
